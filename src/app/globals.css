@@ -1,0 +1,29 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+/* react-beautiful-dnd 样式 */
+[data-rfd-draggable-context-id] {
+  transition: transform 0.2s ease;
+}
+
+[data-rfd-draggable-context-id][aria-roledescription="拖拽中"] {
+  transform: rotate(3deg);
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.15);
+}
+
+/* 拖拽时全局禁用文本选择 */
+body.rfd-dragging {
+  user-select: none !important;
+  -webkit-user-select: none !important;
+  cursor: grabbing !important;
+}
+
+body.rfd-dragging * {
+  user-select: none !important;
+  -webkit-user-select: none !important;
+}
