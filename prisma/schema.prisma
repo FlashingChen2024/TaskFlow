@@ -11,5 +11,6 @@ model Task {
   id        String   @id @default(cuid())
   title     String
   status    String   @default("todo")
+  position  Int      @default(0)
   createdAt DateTime @default(now())
 }
