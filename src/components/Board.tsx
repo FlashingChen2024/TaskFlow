@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { DragDropContext, Droppable, DropResult } from "react-beautiful-dnd";
 import Column from "./Column";
 import NewTaskModal from "./NewTaskModal";
@@ -9,7 +9,6 @@ export interface Task {
   id: string;
   title: string;
   status: string;
-  position: number;
   createdAt: string;
 }
 
@@ -24,18 +23,11 @@ export default function Board() {
   const [loading, setLoading] = useState(true);
   const [modalOpen, setModalOpen] = useState(false);
   const [modalStatus, setModalStatus] = useState("todo");
-  const tasksBeforeDrag = useRef<Task[]>([]);
 
   const fetchTasks = useCallback(async () => {
     const res = await fetch("/api/tasks");
     const data = await res.json();
-    // 兼容：migrate 后旧数据 position 全为 0，按 createdAt 倒序保底
-    if (data.length > 0 && data.every((t: Task) => t.position === 0)) {
-      data.sort(
-        (a: Task, b: Task) =>
-          new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-      );
-    }
+    // 从数据库加载，按createdAt倒序
     setTasks(data);
     setLoading(false);
   }, []);
@@ -50,15 +42,17 @@ export default function Board() {
 
   const onDragStart = () => {
     document.body.classList.add("rfd-dragging");
-    tasksBeforeDrag.current = [...tasks];
   };
 
-  // 拖拽结束后计算各列 position 并批量 PATCH
-  const onDragEnd = async (result: DropResult) => {
+  // 关键：onDragEnd 只更新前端 state，不保存顺序到后端！
+  const onDragEnd = (result: DropResult) => {
     document.body.classList.remove("rfd-dragging");
     const { destination, source, draggableId } = result;
 
+    // 没有目标位置，不做任何处理
     if (!destination) return;
+
+    // 拖回原位置
     if (
       destination.droppableId === source.droppableId &&
       destination.index === source.index
@@ -66,79 +60,52 @@ export default function Board() {
       return;
     }
 
-    // ── 1. 乐观更新本地 state ──
-    let nextTasks: Task[];
+    const taskId = draggableId;
+    const newStatus = destination.droppableId;
 
+    // 跨列拖拽：更新 status（保存到后端）
     if (source.droppableId !== destination.droppableId) {
-      // 跨列：先改 status，再插到目标列的 destination.index
-      nextTasks = tasks.map((t) =>
-        t.id === draggableId ? { ...t, status: destination.droppableId } : t
-      );
-      const destCol = nextTasks.filter((t) => t.status === destination.droppableId);
-      const otherCols = nextTasks.filter((t) => t.status !== destination.droppableId);
-      const moved = destCol.find((t) => t.id === draggableId)!;
-      const destOthers = destCol.filter((t) => t.id !== draggableId);
-      destOthers.splice(destination.index, 0, moved);
-      nextTasks = [...otherCols, ...destOthers];
+      // 先在本地更新
+      setTasks((prev) => {
+        const updated = prev.map((t) =>
+          t.id === taskId ? { ...t, status: newStatus } : t
+        );
+        // 把拖拽的任务放到目标列的最后
+        const sourceTasks = updated.filter((t) => t.status === source.droppableId);
+        const destTasks = updated.filter((t) => t.status === newStatus);
+        const draggedTask = updated.find((t) => t.id === taskId)!;
+        const otherTasks = updated.filter((t) => t.id !== taskId);
+
+        // 重建目标列的顺序：拖拽的卡片在最后
+        const newDestTasks = destTasks.filter((t) => t.id !== taskId);
+        newDestTasks.push(draggedTask);
+
+        return [
+          ...otherTasks.filter((t) => t.status !== newStatus),
+          ...sourceTasks,
+          ...newDestTasks,
+        ];
+      });
+
+      // 调用后端API更新status（注意：只更新status，不保存position！）
+      fetch(`/api/tasks/${taskId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: newStatus }),
+      });
     } else {
-      // 同列：reorder
-      const col = tasks.filter((t) => t.status === source.droppableId);
-      const other = tasks.filter((t) => t.status !== source.droppableId);
-      const idx = col.findIndex((t) => t.id === draggableId);
-      const [moved] = col.splice(idx, 1);
-      col.splice(destination.index, 0, moved);
-      nextTasks = [...other, ...col];
-    }
+      // 同列内拖拽：只更新前端 state，不调用后端！
+      // 这就是 bug 所在：排序只在前端生效，刷新就恢复
+      setTasks((prev) => {
+        const columnTasks = prev.filter((t) => t.status === newStatus);
+        const otherTasks = prev.filter((t) => t.status !== newStatus);
 
-    setTasks(nextTasks);
+        const draggedIndex = columnTasks.findIndex((t) => t.id === taskId);
+        const [draggedTask] = columnTasks.splice(draggedIndex, 1);
+        columnTasks.splice(destination.index, 0, draggedTask);
 
-    // ── 2. 计算需要 PATCH 的变更 ──
-    const byStatus: Record<string, Task[]> = {};
-    for (const t of nextTasks) {
-      if (!byStatus[t.status]) byStatus[t.status] = [];
-      byStatus[t.status].push(t);
-    }
-
-    const patches: { id: string; body: { status?: string; position: number } }[] = [];
-    for (const status of Object.keys(byStatus)) {
-      const col = byStatus[status];
-      for (let i = 0; i < col.length; i++) {
-        const task = col[i];
-        const isMoved = task.id === draggableId;
-        const needStatus = isMoved && source.droppableId !== destination.droppableId;
-        if (task.position !== i || needStatus) {
-          patches.push({
-            id: task.id,
-            body: {
-              ...(needStatus ? { status: destination.droppableId } : {}),
-              position: i,
-            },
-          });
-        }
-      }
-    }
-
-    if (patches.length === 0) return;
-
-    // ── 3. 批量 PATCH，任一失败则回滚 ──
-    try {
-      const results = await Promise.all(
-        patches.map((p) =>
-          fetch(`/api/tasks/${p.id}`, {
-            method: "PATCH",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(p.body),
-          })
-        )
-      );
-
-      if (!results.every((r) => r.ok)) {
-        throw new Error("Some PATCH requests failed");
-      }
-    } catch (err) {
-      setTasks(tasksBeforeDrag.current);
-      console.error("保存排序失败，已自动回滚", err);
-      // MVP 阶段先用 console.error，后续可接入 toast
+        return [...otherTasks, ...columnTasks];
+      });
     }
   };
 
@@ -153,23 +120,15 @@ export default function Board() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ title, status: modalStatus }),
     });
-    if (!res.ok) {
-      console.error("创建任务失败");
-      return;
-    }
-    // 创建成功后重新拉取整列表，保证顺序一致
-    await fetchTasks();
+    const newTask = await res.json();
+    // 新任务加到对应列的最后
+    setTasks((prev) => [...prev, newTask]);
     setModalOpen(false);
   };
 
   const handleDeleteTask = async (id: string) => {
-    const res = await fetch(`/api/tasks/${id}`, { method: "DELETE" });
-    if (!res.ok) {
-      console.error("删除任务失败");
-      return;
-    }
-    // 删除后重新拉取，避免 position 出现空洞
-    await fetchTasks();
+    await fetch(`/api/tasks/${id}`, { method: "DELETE" });
+    setTasks((prev) => prev.filter((t) => t.id !== id));
   };
 
   if (loading) {
